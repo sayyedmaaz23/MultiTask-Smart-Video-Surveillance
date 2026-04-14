@@ -1,0 +1,49 @@
+# =========================
+# 🔹 Python (Backend)
+# =========================
+backend/ims_env/
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+
+# Logs
+backend/*.log
+backend/logs.txt
+
+# Model weights (AI)
+backend/**/*.pt
+backend/**/*.pth
+backend/**/*.onnx
+
+# Datasets / media
+backend/data/
+backend/datasets/
+backend/videos/
+backend/images/
+backend/ViViT/
+backend/Yolo/
+backend/ResNet-18/
+backend/Clip_MIL/
+backend/ConvLSTM_Autoencoder/
+
+
+# =========================
+# 🔹 Node (Frontend)
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Logs
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# =========================
+# 🔹 General
+# =========================
+.vscode/
+.env
+.DS_Store
+Thumbs.db

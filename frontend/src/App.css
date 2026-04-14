@@ -1,0 +1,45 @@
+:root {
+  --primary: #33bfff;
+  --secondary: #273850;
+  --accent: #3a86ff;
+  --warn: #ffac30;
+  --background: #181929;
+  --glass: rgba(40,48,70,0.89);
+  --panel-dark: #232844;
+  --text: #f2f4fa;
+  --border: #283049;
+}
+
+.glass-panel {
+  background: var(--glass);
+  border-radius: 18px;
+  box-shadow: 0 8px 36px #11204038;
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(51,191,255,0.13);
+  padding: 2rem;
+}
+
+.section-title {
+  color: var(--primary);
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-shadow: 0 2px 8px #3a86ff38;
+}
+
+.button-group {
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+button {
+  transition: box-shadow 0.22s, background 0.22s, transform 0.2s;
+  border-radius: 9px !important;
+}
+
+button:hover {
+  box-shadow: 0 4px 18px #3a86ff67;
+  background: var(--accent) !important;
+  color: var(--text) !important;
+  transform: scale(1.04);
+}

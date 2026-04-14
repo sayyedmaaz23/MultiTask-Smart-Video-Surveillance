@@ -1,0 +1,7 @@
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  font-family: "Inter", "Roboto", sans-serif;
+  background: linear-gradient(120deg, #181929 0%, #232644 100%);
+  color-scheme: dark;
+}
