@@ -26,11 +26,11 @@ const LABELS = [
   "Burglary",
   "Explosion",
   "Fighting",
-  "Normal",
+  // "Normal",
   "RoadAccidents",
   "Robbery",
   "Shooting",
-  "Shoplifting",
+  // "Shoplifting",
   "Stealing",
   "Vandalism",
 ];

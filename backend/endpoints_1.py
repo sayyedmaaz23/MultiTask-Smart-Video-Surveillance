@@ -187,16 +187,19 @@ def yolo_worker_annotating():
 
 def _fire_alert(label: str, message: str, conf, start_str: str, end_str: str | None):
     """Called from sync threads (YOLO worker). Runs the async broadcast in a new loop."""
-    payload = {
-        "event":      "alert",
-        "type":       label,
-        "message":    message,
-        "confidence": round(conf, 4) if conf is not None else None,
-        "clip_start": start_str,
-        "clip_end":   end_str or start_str,
-        "timestamp":  datetime.datetime.now().isoformat(),
-    }
-    asyncio.run(_async_broadcast(payload))
+    if label == "normal":
+        return
+    else:
+        payload = {
+            "event":      "alert",
+            "type":       label,
+            "message":    message,
+            "confidence": round(conf, 4) if conf is not None else None,
+            "clip_start": start_str,
+            "clip_end":   end_str or start_str,
+            "timestamp":  datetime.datetime.now().isoformat(),
+        }
+        asyncio.run(_async_broadcast(payload))
 
 
 async def _async_broadcast(message: dict):

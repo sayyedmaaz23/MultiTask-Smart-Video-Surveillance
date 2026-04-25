@@ -442,7 +442,7 @@ def _final_output(vivit_results, start_ts: datetime.datetime, end_ts: datetime.d
     avg   = total / len(vivit_results)
     label = config.LABELS[avg.argmax().item()]
     conf  = avg.max().item()
-    if conf < config.VIVIT_CONF_THRESHOLD:
+    if conf < config.VIVIT_CONF_THRESHOLD and label != "Normal":
         label = "Unknown"
         conf = 0.0
     start_str = start_ts.strftime("%H:%M:%S") if start_ts else "unknown"
@@ -452,18 +452,19 @@ def _final_output(vivit_results, start_ts: datetime.datetime, end_ts: datetime.d
     print(f"[ViViT]    Clip window: {start_str} → {end_str}")
 
     # Broadcast to FastAPI WebSocket clients
-    from endpoints_1 import broadcast_message, alert_settings
-    import asyncio
-    if alert_settings.get(label, True):
-        asyncio.run(broadcast_message({
-            "event":      "alert",
-            "type":       label,
-            "message":    f"{label} detected!",
-            "confidence": round(conf, 4),
-            "clip_start": start_str,
-            "clip_end":   end_str,
-            "timestamp":  datetime.datetime.now().isoformat(),
-        }))
+    if label != "Normal":
+        from endpoints_1 import broadcast_message, alert_settings
+        import asyncio
+        if alert_settings.get(label, True):
+            asyncio.run(broadcast_message({
+                "event":      "alert",
+                "type":       label,
+                "message":    f"{label} detected!",
+                "confidence": round(conf, 4),
+                "clip_start": start_str,
+                "clip_end":   end_str,
+                "timestamp":  datetime.datetime.now().isoformat(),
+            }))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
