@@ -1,4 +1,6 @@
 import os
+
+import main_timestamp
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import cv2
@@ -12,44 +14,28 @@ from threading import Thread
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-
+import mediapipe as mp
 import config
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 
-import main_timestamp
 from main_timestamp import (
     initialization,
     feeder,
     ACLAE_inference,
-    stop_event,
-    CLIPS_DIR,
+    stop_event
 )
 
-
-def _save_suspicious_frame(frame, label: str) -> str | None:
-    if frame is None:
-        return None
-
-    ts_str = datetime.datetime.now().strftime("%Y%m%d_%H-%M-%S")
-    filename = f"{label}_{ts_str}.jpg"
-    filepath = os.path.join(CLIPS_DIR, filename)
-
-    try:
-        cv2.imwrite(filepath, frame)
-        print(f"[Frame] Saved: {filename}")
-        return filename
-    except Exception as e:
-        print(f"[Frame] ERROR saving frame: {e}")
-        return None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHARED STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
+# latest_frame holds a JPEG-encoded frame with YOLO boxes drawn on it.
+# Written by yolo_worker_annotating(), read by /video_feed.
 latest_frame: bytes | None = None
 frame_lock   = threading.Lock()
 
@@ -71,14 +57,53 @@ alert_settings: dict = {
     "RoadAccidents":   True,
     "Robbery":         True,
     "Shooting":        True,
+    # "Shoplifting":     True,
     "Stealing":        True,
     "Vandalism":       True,
 }
 
 
+mp_face = mp.solutions.face_mesh
+mp_hands = mp.solutions.hands
+
+face_mesh = mp_face.FaceMesh(static_image_mode=False, max_num_faces=1)
+hands = mp_hands.Hands(max_num_hands=2)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# YOLO ANNOTATING WORKER
+# YOLO WORKER  (replaces the bare yolo_worker from main_3)
+# Draws boxes on each frame, writes JPEG to latest_frame, fires YOLO alerts.
 # ══════════════════════════════════════════════════════════════════════════════
+
+#Helper: Get mouth center from face landmarks
+def get_mouth_center(face_landmarks, frame_shape):
+    h, w, _ = frame_shape
+    
+    # Mouth landmarks (approx)
+    mouth_ids = [13, 14]  # upper + lower lip
+    
+    points = []
+    for idx in mouth_ids:
+        lm = face_landmarks.landmark[idx]
+        points.append((int(lm.x * w), int(lm.y * h)))
+    
+    cx = sum(p[0] for p in points) // len(points)
+    cy = sum(p[1] for p in points) // len(points)
+    
+    return (cx, cy)
+
+#Helper: Get hand centers from hand landmarks
+def get_hand_centers(hand_landmarks, frame_shape):
+    h, w, _ = frame_shape
+    centers = []
+    
+    for hand in hand_landmarks:
+        # Use index fingertip (id=8)
+        lm = hand.landmark[8]
+        centers.append((int(lm.x * w), int(lm.y * h)))
+    
+    return centers
+
 
 _LABEL_COLORS = {
     "person":    (255, 80,  80),
@@ -101,8 +126,8 @@ def yolo_worker_annotating():
     COOLDOWN        = getattr(config, "COOLDOWN", 5)
     _last_smoking   = 0.0
     _last_crowd     = 0.0
-    smoking_counter = 0
-    smoking_last    = 0.0
+    smoking_counter = 0          # fix 1 — initialize before use
+    smoking_last    = 0.0        # separate from _last_smoking (used in counter logic)
 
     while True:
         try:
@@ -124,67 +149,90 @@ def yolo_worker_annotating():
 
         person_centers    = []
         cigarette_centers = []
-        annotated         = frame.copy()
+        annotated         = frame.copy()   # fix 3 — draw on annotated from here on
 
         for box in results.boxes:
             cls             = int(box.cls[0])
             label           = main_timestamp.Yolo.names[cls].lower()
             conf            = float(box.conf[0])
-            x1, y1, x2, y2  = map(int, box.xyxy[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
             cx, cy          = (x1 + x2) // 2, (y1 + y2) // 2
-            color           = _LABEL_COLORS.get(label, _DEFAULT_COLOR)
-
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                annotated,
-                f"{label} {conf:.2f}",
-                (x1, max(y1 - 6, 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2
-            )
 
             if label == "person":
                 person_centers.append((cx, cy))
+                color = (255, 80, 80)
             elif label == "cigarette":
                 cigarette_centers.append((cx, cy))
+                color = (0, 0, 255)
+            else:
+                color = (0, 255, 0)
+
+            # fix 3 — annotated not frame
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(annotated, f"{label} {conf:.2f}", (x1, max(y1 - 5, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         now = time.time()
 
-        # ── Smoking Detection ────────────────────────────────
-        smoking_detected = any(
-            np.linalg.norm(np.array(p) - np.array(c)) < config.SMOKING_DISTANCE
-            for p in person_centers for c in cigarette_centers
-        )
+        # ── MediaPipe processing ───────────────────────────────────────────────
+        rgb_frame    = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        face_results = face_mesh.process(rgb_frame)
+        hand_results = hands.process(rgb_frame)
+
+        mouth_center = None
+        hand_centers = []
+
+        if face_results.multi_face_landmarks:
+            mouth_center = get_mouth_center(
+                face_results.multi_face_landmarks[0], annotated.shape
+            )
+
+        if hand_results.multi_hand_landmarks:
+            hand_centers = get_hand_centers(
+                hand_results.multi_hand_landmarks, annotated.shape
+            )
+
+        # ── Debug points ───────────────────────────────────────────────────────
+        if config.SHOW_DEBUG_POINTS:
+            if mouth_center:
+                cv2.circle(annotated, mouth_center, 5, (0, 255, 255), -1)
+            for hand in hand_centers:
+                cv2.circle(annotated, hand, 5, (255, 255, 0), -1)
+
+        # ── Smoking detection ──────────────────────────────────────────────────
+        hand_near_mouth = False
+        if mouth_center and hand_centers:
+            for hand in hand_centers:
+                dist = np.linalg.norm(np.array(hand) - np.array(mouth_center))
+                if dist < config.HAND_MOUTH_DISTANCE:
+                    hand_near_mouth = True
+                    break
+
+        smoking_detected = len(cigarette_centers) > 0 and hand_near_mouth
 
         if smoking_detected:
             smoking_counter += 1
         else:
-            smoking_counter = 0
+            smoking_counter = 0   # fix 2 — reset counter when not detected
 
+        # Trigger only after sustained detection + cooldown
         if (
-            smoking_counter >= getattr(config, "SMOKING_FRAMES_REQUIRED", 5)
+            smoking_counter >= config.SMOKING_FRAMES_REQUIRED
             and alert_settings.get("Smoking", True)
             and now - smoking_last > COOLDOWN
         ):
             smoking_last    = now
-            smoking_counter = 0
-
+            smoking_counter = 0   # fix 2 — reset after firing so it must re-confirm
             print("[YOLO] ⚠ Smoking detected!")
-
-            # 🔥 Save annotated frame
-            _save_suspicious_frame(annotated, "Smoking")
-
             _fire_alert(
-                "Smoking",
-                "Smoking detected!",
-                None,
-                datetime.datetime.now().strftime("%H:%M:%S"),
-                None
+                label="Smoking",
+                message="Smoking detected!",
+                conf=None,
+                start_str=datetime.datetime.now().strftime("%H:%M:%S"),
+                end_str=None,
             )
 
-        # ── Crowd Detection ─────────────────────────────────
+        # ── Crowd alert ────────────────────────────────────────────────────────
         if (
             len(person_centers) >= config.GROUP_COUNT
             and alert_settings.get("Group of People", True)
@@ -192,24 +240,18 @@ def yolo_worker_annotating():
         ):
             arr         = np.array(person_centers)
             dist_matrix = np.linalg.norm(arr[:, None] - arr[None, :], axis=2)
-
             if np.any((dist_matrix < config.GROUP_DISTANCE).sum(axis=1) >= config.GROUP_COUNT):
                 _last_crowd = now
-
                 print("[YOLO] ⚠ Group detected!")
-
-                # 🔥 Save annotated frame
-                _save_suspicious_frame(annotated, "Crowd")
-
                 _fire_alert(
-                    "Group of People",
-                    "Group of people detected!",
-                    None,
-                    datetime.datetime.now().strftime("%H:%M:%S"),
-                    None
+                    label="Group of People",
+                    message="Group of people detected!",
+                    conf=None,
+                    start_str=datetime.datetime.now().strftime("%H:%M:%S"),
+                    end_str=None,
                 )
 
-        # ── Stream annotated frame ──────────────────────────
+        # ── Store annotated frame ──────────────────────────────────────────────
         ok, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
             with frame_lock:
@@ -223,19 +265,21 @@ def yolo_worker_annotating():
 # BROADCAST HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _fire_alert(label: str, message: str, conf, start_str: str, end_str: str | None,
-                clip_file: str | None = None):
-    payload = {
-        "event":      "alert",
-        "type":       label,
-        "message":    message,
-        "confidence": round(conf, 4) if conf is not None else None,
-        "clip_start": start_str,
-        "clip_end":   end_str or start_str,
-        "clip_file":  clip_file,
-        "timestamp":  datetime.datetime.now().isoformat(),
-    }
-    asyncio.run(_async_broadcast(payload))
+def _fire_alert(label: str, message: str, conf, start_str: str, end_str: str | None):
+    """Called from sync threads (YOLO worker). Runs the async broadcast in a new loop."""
+    if label == "normal":
+        return
+    else:
+        payload = {
+            "event":      "alert",
+            "type":       label,
+            "message":    message,
+            "confidence": round(conf, 4) if conf is not None else None,
+            "clip_start": start_str,
+            "clip_end":   end_str or start_str,
+            "timestamp":  datetime.datetime.now().isoformat(),
+        }
+        asyncio.run(_async_broadcast(payload))
 
 
 async def _async_broadcast(message: dict):
@@ -252,31 +296,30 @@ async def _async_broadcast(message: dict):
 
 
 async def broadcast_message(message: dict):
-    """Called from main_timestamp._final_output for ViViT detections."""
+    """
+    Called from main_3._final_output for ViViT detections.
+    Must be awaited — runs inside the FastAPI event loop via asyncio.run()
+    in _final_output.
+    """
     await _async_broadcast(message)
 
 
 def _append_log(message: dict):
-    """
-    Writes a JSON line per alert so /api/logs can return structured data
-    the frontend can parse without regex.
-    Format: one JSON object per line (JSON-Lines).
-    """
     log_path = getattr(config, "LOG_FILE", None)
     if not log_path:
         return
     try:
-        record = {
-            "timestamp":  message.get("timestamp", datetime.datetime.now().isoformat()),
-            "type":       message.get("type", "Unknown"),
-            "message":    message.get("message", ""),
-            "confidence": message.get("confidence"),
-            "clip_start": message.get("clip_start", ""),
-            "clip_end":   message.get("clip_end", ""),
-            "clip_file":  message.get("clip_file"),   # filename or null
-        }
+        clip_start = message.get("clip_start", "")
+        clip_end   = message.get("clip_end",   "")
+        window_str = f" [{clip_start} → {clip_end}]" if clip_start else ""
+        conf       = message.get("confidence")
+        conf_str   = f" (conf: {conf})" if conf is not None else ""
+        entry = (
+            f"{message.get('timestamp', datetime.datetime.now().isoformat())} "
+            f"- {message.get('type', 'Unknown')}{window_str}{conf_str}\n"
+        )
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+            f.write(entry)
     except OSError as e:
         print(f"[Log] WARNING: Could not write to log file — {e}")
 
@@ -320,6 +363,8 @@ app = FastAPI(title="CCTV Alert System", lifespan=lifespan)
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+else:
+    print("[Startup] WARNING: 'static' directory not found — /static not mounted.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -336,6 +381,11 @@ app.add_middleware(
 
 @app.get("/video_feed")
 def video_feed():
+    """
+    MJPEG stream of YOLO-annotated frames.
+    Frontend points an <img> src at this URL.
+    Delay is natural — YOLO inference takes time.
+    """
     def generate():
         while not stop_event.is_set():
             with frame_lock:
@@ -344,18 +394,20 @@ def video_feed():
                 time.sleep(0.01)
                 continue
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            time.sleep(0.033)
+            time.sleep(0.033)   # ~30 fps ceiling
 
-    return StreamingResponse(generate(),
-                             media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.get("/api/logs")
 def get_logs():
     """
-    Returns last 50 log entries as JSON objects.
-    Each entry: { timestamp, type, message, confidence, clip_start, clip_end, clip_file }
-    clip_file is null for YOLO-only alerts, a filename string for ViViT detections.
+    Returns the last 50 log entries.
+    Frontend polls this ~800 ms after each WebSocket alert.
+    Each line format: <timestamp> - <type> [<start> → <end>] (conf: <n>)
     """
     log_path = getattr(config, "LOG_FILE", None)
     if not log_path or not os.path.exists(log_path):
@@ -363,65 +415,31 @@ def get_logs():
     try:
         with open(log_path, "r", encoding="utf-8") as f:
             lines = f.readlines()[-50:]
-        logs = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                logs.append(json.loads(line))
-            except json.JSONDecodeError:
-                # Graceful fallback for any old plain-text lines
-                logs.append({"type": "Log", "message": line,
-                              "timestamp": None, "clip_file": None})
-        return {"logs": logs}
-    except OSError as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.get("/clips/{filename}")
-def serve_clip(filename: str):
-    """
-    Streams a saved anomaly clip back to the frontend.
-    filename must be a bare name (no path separators) for safety.
-    """
-    # Security: reject any path traversal attempts
-    if "/" in filename or "\\" in filename or ".." in filename:
-        return JSONResponse(status_code=400, content={"error": "Invalid filename."})
-
-    filepath = os.path.join(CLIPS_DIR, filename)
-    if not os.path.exists(filepath):
-        return JSONResponse(status_code=404, content={"error": "Clip not found."})
-
-    return FileResponse(
-        filepath,
-        media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes"},   # enables seeking in the browser player
-    )
-
-
-@app.get("/api/clips")
-def list_clips():
-    """Returns a list of all saved clip filenames, newest first."""
-    try:
-        files = sorted(
-            [f for f in os.listdir(CLIPS_DIR) if f.endswith(".mp4")],
-            key=lambda f: os.path.getmtime(os.path.join(CLIPS_DIR, f)),
-            reverse=True,
-        )
-        return {"clips": files}
+        return {"logs": [l.strip() for l in lines if l.strip()]}
     except OSError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.websocket("/ws/alerts")
 async def websocket_endpoint(ws: WebSocket):
+    """
+    Persistent WebSocket. Frontend receives alert objects:
+    {
+      event:      "alert",
+      type:       "Burglary",          // matches frontend labels list
+      message:    "Burglary detected!",
+      confidence: 0.7395,              // null for YOLO-only alerts
+      clip_start: "23:44:07",
+      clip_end:   "23:44:22",
+      timestamp:  "2026-04-13T23:44:22.123456"
+    }
+    """
     await ws.accept()
     async with ws_lock:
         ws_clients.add(ws)
     try:
         while True:
-            await ws.receive_text()
+            await ws.receive_text()     # keeps the connection alive
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -433,6 +451,11 @@ async def websocket_endpoint(ws: WebSocket):
 
 @app.post("/update-settings")
 async def update_settings(request: Request):
+    """
+    Receives { label: bool, ... } from the frontend Settings dialog.
+    Updates alert_settings immediately — no restart needed.
+    Both YOLO and ViViT alerts check this before broadcasting.
+    """
     global alert_settings
     try:
         data = await request.json()
@@ -440,6 +463,7 @@ async def update_settings(request: Request):
         return JSONResponse(status_code=400, content={"error": "Invalid JSON payload."})
     if not isinstance(data, dict):
         return JSONResponse(status_code=400, content={"error": "Expected a JSON object."})
+
     alert_settings = data
     print("[Settings] Updated:", alert_settings)
     return {"status": "ok"}

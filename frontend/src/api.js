@@ -1,30 +1,26 @@
-import axios from "axios";
 const BASE = "http://localhost:8000";
 
 export async function fetchLogs() {
   try {
-    const res = await axios.get(`${BASE}/api/logs`);
-    const rawLogs = res.data?.logs ?? [];
-
-    // Convert: "2025-10-25 12:10:03 - Smoking detected"
-    // Into:   { timestamp: "...", type: "smoking", message: "Smoking detected" }
-    const parsedLogs = rawLogs.map(line => {
-      const [timestamp, message] = line.split(" - ");
-
-      let type = "unknown";
-      if (message.toLowerCase().includes("smoking")) type = "smoking";
-      if (message.toLowerCase().includes("group")) type = "group";
-
-      return { timestamp, message, type };
-    });
-
-    return parsedLogs.reverse(); // newest first (optional)
-  } catch (e) {
-    console.error("fetchLogs error", e);
+    const res = await fetch(`${BASE}/api/logs`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // Backend returns { logs: [...objects] } — pass through as-is, no string parsing
+    return data?.logs ?? [];
+  } catch (err) {
+    console.error("fetchLogs error", err);
     return [];
   }
 }
 
-export function snapshotUrl(relativePath) {
-  return `${BASE}${relativePath}`;
+export async function fetchClips() {
+  try {
+    const res = await fetch(`${BASE}/api/clips`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return data?.clips ?? [];
+  } catch (err) {
+    console.error("fetchClips error", err);
+    return [];
+  }
 }

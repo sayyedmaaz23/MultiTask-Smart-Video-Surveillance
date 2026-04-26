@@ -1,6 +1,6 @@
 import sys
 import os
-import subprocess
+
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import torch
@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from torch.nn import MSELoss
 import threading
-from threading import Thread, Event
+from threading import Thread, Event, active_count
 from ultralytics import YOLO
 from collections import deque
 from queue import Queue, Empty
@@ -30,7 +30,7 @@ stage2_3_queue = Queue(maxsize=30)
 Aclae_queue    = Queue(maxsize=10)
 yolo_queue     = Queue(maxsize=10)
 
-# ── Model handles ──────────────────────────────────────────────────────────────
+# ── Model handles (set during initialization) ──────────────────────────────────
 Yolo   = None
 Aclae  = None
 MILnet = None
@@ -40,14 +40,11 @@ ViViT  = None
 # ── Coordination ───────────────────────────────────────────────────────────────
 stop_event     = Event()
 stage2_running = False
+# Lock so only one thread can spawn / inspect Sec2_thread at a time
 _sec2_lock     = threading.Lock()
-_sec2_thread   = None
+_sec2_thread   = None          # always access via _sec2_lock
 
 mse = MSELoss()
-
-# ── Clips output directory ─────────────────────────────────────────────────────
-CLIPS_DIR = os.path.join(os.path.dirname(__file__), "clips")
-os.makedirs(CLIPS_DIR, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,76 +62,27 @@ def compute_optical_flow(prev, nxt):
 
 
 def _ensure_stage2_running():
+    """
+    Spawn a fresh Stage-2 thread if one is not already alive.
+    Protected by _sec2_lock so concurrent callers can't double-spawn.
+    """
     global stage2_running, _sec2_thread
     with _sec2_lock:
         if _sec2_thread is not None and _sec2_thread.is_alive():
-            return
+            return                          # already running — nothing to do
         _sec2_thread = Thread(target=stage2_pipeline, daemon=True, name="Stage2")
         _sec2_thread.start()
         stage2_running = True
         print("[ACLAE] Stage-2 thread spawned.")
 
-def _save_clip(all_frames: list, label: str, start_ts: datetime.datetime) -> str | None:
-    if not all_frames:
-        return None
 
-    ts_str   = start_ts.strftime("%Y%m%d_%H-%M-%S") if start_ts else "unknown"
-    filename = f"{label}_{ts_str}.mp4"
-    filepath = os.path.join(CLIPS_DIR, filename)
-    temp_path = filepath.replace(".mp4", "_temp.mp4")
-
-    h, w = all_frames[0].shape[:2]
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(temp_path, fourcc, config.CLIP_FPS, (w, h))
-
-    if not out.isOpened():
-        print(f"[Clip] ERROR: Could not open VideoWriter for {temp_path}")
-        return None
-
-    for frame in all_frames:
-        out.write(frame)
-    out.release()
-
-    # 🔥 FFMPEG CONVERSION
-    ffmpeg_path = r"C:\Users\sayye\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-
-    cmd = f'"{ffmpeg_path}" -y -i "{temp_path}" -vcodec libx264 -acodec aac "{filepath}"'
-
-    print("[DEBUG] Running FFmpeg command:")
-    print(cmd)
-
-    try:
-        subprocess.run([
-        ffmpeg_path,
-        "-y",
-        "-i", temp_path,
-        "-vcodec", "libx264",
-        "-acodec", "aac",
-        filepath
-    ], check=True)
-
-    except subprocess.CalledProcessError as e:
-        print("[ERROR] FFmpeg conversion failed:", e)
-        return None
-
-    # if ret != 0:
-    #     print("[ERROR] FFmpeg conversion failed!")
-    #     return None
-
-    # Cleanup only if success
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-
-    print(f"[Clip] Saved (final): {filename} ({len(all_frames)} frames)")
-    return filename
 # ══════════════════════════════════════════════════════════════════════════════
 # THREAD 1 — FEEDER
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
-def feeder(video_source=r"C:\Users\sayye\Downloads\Test_Car_acc.mp4"):
+def feeder(video_source=r"C:\Users\sayye\Downloads\Road traffic video for object recognition.mp4"):
     src = video_source or config.VIDEO_SOURCE
-    cap = cv2.VideoCapture(src)
+    cap = cv2.VideoCapture(0)
 
     if not cap.isOpened():
         print(f"[Feeder] ERROR: Cannot open video source '{src}'. Sending sentinels.")
@@ -153,13 +101,14 @@ def feeder(video_source=r"C:\Users\sayye\Downloads\Test_Car_acc.mp4"):
         try:
             yolo_queue.put(frame.copy(), timeout=1)
         except Exception:
-            pass
+            pass  # drop frame — YOLO can miss frames
 
         try:
             Aclae_queue.put(frame.copy(), timeout=1)
         except Exception:
             pass
 
+    # Sentinels shut down consumer threads cleanly
     yolo_queue.put(None)
     Aclae_queue.put(None)
     cap.release()
@@ -167,7 +116,7 @@ def feeder(video_source=r"C:\Users\sayye\Downloads\Test_Car_acc.mp4"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD 2 — YOLO (bare version — annotating version lives in endpoints)
+# THREAD 2 — YOLO
 # ══════════════════════════════════════════════════════════════════════════════
 
 def yolo_worker():
@@ -185,7 +134,7 @@ def yolo_worker():
                 break
             continue
 
-        if frame is None:
+        if frame is None:       # sentinel
             break
 
         try:
@@ -196,28 +145,35 @@ def yolo_worker():
             continue
 
         person_centers, cigarette_centers = [], []
+
         for box in results.boxes:
             cls   = int(box.cls[0])
             label = Yolo.names[cls].lower()
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
             if label == "person":
                 person_centers.append((cx, cy))
             elif label == "cigarette":
                 cigarette_centers.append((cx, cy))
 
+        # ── Smoking check ──────────────────────────────────────────────────────
         smoking = any(
             np.linalg.norm(np.array(p) - np.array(c)) < config.SMOKING_DISTANCE
             for p in person_centers for c in cigarette_centers
         )
         if smoking:
             print("[YOLO] ⚠ Smoking detected!")
+            # pass
+            # TODO: hook your alert/broadcast here
 
+        # ── Crowd check ────────────────────────────────────────────────────────
         if len(person_centers) >= config.GROUP_COUNT:
             arr = np.array(person_centers)
             dist_matrix = np.linalg.norm(arr[:, None] - arr[None, :], axis=2)
             if np.any((dist_matrix < config.GROUP_DISTANCE).sum(axis=1) >= config.GROUP_COUNT):
                 print("[YOLO] ⚠ Group detected!")
+                # TODO: hook your alert/broadcast here
 
         yolo_queue.task_done()
 
@@ -225,7 +181,7 @@ def yolo_worker():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD 3 — ACLAE
+# THREAD 3 — ACLAE (ConvLSTM anomaly detector)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ACLAE_inference():
@@ -244,9 +200,8 @@ def ACLAE_inference():
     s                 = False
     main_buffer       = []
     clips_count       = 0
-    anomaly_streak    = 0
-    anomaly_start_ts  = None
-    anomaly_end_ts    = None
+    anomaly_start_ts  = None   # wall-clock time when anomaly was first detected
+    anomaly_end_ts    = None   # wall-clock time when the collection window closes
 
     while True:
         try:
@@ -256,13 +211,14 @@ def ACLAE_inference():
                 break
             continue
 
-        if frame is None:
+        if frame is None:       # sentinel
             break
 
-        # ── Clip collection ────────────────────────────────────────────────────
+        # ── Clip collection (active anomaly window) ────────────────────────────
         if s:
             main_buffer.append(frame)
             if len(main_buffer) == 32:
+                # print(f"[ACLAE] Clips count={clips_count + 1}  queue={stage2_3_queue.qsize()}")
                 try:
                     stage2_3_queue.put(
                         (main_buffer.copy(), anomaly_start_ts, datetime.datetime.now()),
@@ -271,11 +227,12 @@ def ACLAE_inference():
                 except Exception:
                     print("[ACLAE] WARNING: stage2 queue full — clip dropped.")
                 clips_count += 1
-                main_buffer = main_buffer[-5:]
+                main_buffer = main_buffer[-5:]      # 5-frame overlap
 
                 if stage2_3_queue.qsize() >= 15:
+                    print("[ACLAE] Clip limit reached — resetting collection.")
                     anomaly_end_ts = datetime.datetime.now()
-                    print(f"[ACLAE] Window complete: "
+                    print(f"[ACLAE] Anomaly window: "
                           f"{anomaly_start_ts.strftime('%H:%M:%S')} → "
                           f"{anomaly_end_ts.strftime('%H:%M:%S')}")
                     _ensure_stage2_running()
@@ -315,13 +272,14 @@ def ACLAE_inference():
                 [np.array(rgb_buffer), np.array(flow_buffer)], axis=-1
             ).transpose(0, 3, 1, 2)
 
-            input_tensor = torch.tensor(combined, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            input_tensor = (torch.tensor(combined, dtype=torch.float32)
+                            .unsqueeze(0).to(DEVICE))
 
             with torch.no_grad():
                 recon, prob = Aclae(input_tensor)
 
             err           = mse(recon, input_tensor[:, -1]).item()
-            anomaly_score = 0.2 * err + 0.8 * prob.item()
+            anomaly_score = 0.45 * err + 0.55 * prob.item()
 
         except Exception as e:
             print(f"[ACLAE] Inference error: {e}")
@@ -342,30 +300,26 @@ def ACLAE_inference():
             std_s  = max(np.std(score_history), 1e-6)
             current_threshold = mean_s + config.Z * std_s
 
-        # ── Streak-confirmed trigger ───────────────────────────────────────────
-        if not s:
-            if anomaly_score > current_threshold:
-                anomaly_streak += 1
-                if anomaly_streak >= config.STREAK_REQUIRED:
-                    print(f"[ConvLSTM] ⚠ Anomaly confirmed! score={anomaly_score:.4f}")
-                    s                = True
-                    anomaly_start_ts = datetime.datetime.now()
-                    main_buffer.extend(temp_frame_buffer)
-                    anomaly_streak   = 0
-            else:
-                anomaly_streak = 0
+        # ── Trigger anomaly collection ─────────────────────────────────────────
+        if not s and anomaly_score > current_threshold:
+            print(f"[ConvLSTM] ⚠ Anomaly! score={anomaly_score:.4f} "
+                  f"threshold={current_threshold:.4f}")
+            s                = True
+            anomaly_start_ts = datetime.datetime.now()
+            main_buffer.extend(temp_frame_buffer)
 
         Aclae_queue.task_done()
 
+    # ── End of stream flush ────────────────────────────────────────────────────
     if stage2_3_queue.qsize() > 0 and not stage2_running:
-        print("[ACLAE] End of stream — flushing to Stage-2.")
+        print("[ACLAE] End of stream — flushing remaining clips to Stage-2.")
         _ensure_stage2_running()
 
     print("[ConvLSTM] Done.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD 4 — STAGE-2
+# THREAD 4 — STAGE-2  (MIL + ResNet-18 + ViViT)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def stage2_pipeline():
@@ -387,6 +341,7 @@ def stage2_pipeline():
 
 
 def _run_mil_and_vivit():
+    # Drain queue
     entries = []
     while stage2_3_queue.qsize() > 0:
         try:
@@ -396,25 +351,35 @@ def _run_mil_and_vivit():
                 entries.append((clip, start_ts, end_ts))
         except Empty:
             break
+    
+    if stage2_3_queue.qsize() ==0:
+            print("[Stage-2] Queue drained. Current window is empty")
 
     if not entries:
         return
 
-    # Group by window
+    # ── Group clips by anomaly window (keyed on start_ts) ─────────────────────
     windows: dict = {}
     for clip, start_ts, end_ts in entries:
-        key = start_ts
+        key = start_ts  # datetime object — unique per anomaly trigger
         if key not in windows:
             windows[key] = {"clips": [], "start_ts": start_ts, "end_ts": end_ts}
         windows[key]["clips"].append(clip)
+        # Keep the latest end_ts seen for this window
         if end_ts is not None:
             windows[key]["end_ts"] = end_ts
 
+    # ── Process each window independently ─────────────────────────────────────
     for window in windows.values():
-        _process_window(window["clips"], window["start_ts"], window["end_ts"])
+        _process_window(
+            window["clips"],
+            window["start_ts"],
+            window["end_ts"],
+        )
 
 
 def _process_window(clips, start_ts, end_ts):
+    """Run MIL + ResNet + ViViT for one anomaly window."""
     prob_ordered_clips, raw_scores = [], []
 
     with torch.no_grad():
@@ -440,17 +405,14 @@ def _process_window(clips, start_ts, end_ts):
     for i in range(len(prob_ordered_clips)):
         prob_ordered_clips[i] = (weights[i].item(), prob_ordered_clips[i][1])
 
-    selected = prob_ordered_clips[:min(10, len(prob_ordered_clips))]
-    prob_ordered_clips.clear()
-
+    selected     = prob_ordered_clips[:min(10, len(prob_ordered_clips))]
+    prob_ordered_clips.clear()  # free memory
+    print("Old window cleared")
     vivit_results = []
-    # Collect ALL frames from ALL selected clips so we can save the full window
-    all_window_frames = []
 
     for _, clip in selected:
         if len(clip) != 32:
             continue
-        all_window_frames.extend(clip)   # accumulate raw frames for MP4
         try:
             frames = np.stack([_preprocess_vivit(f) for f in clip], axis=0)
             clip_t = torch.from_numpy(frames).float().unsqueeze(0).to(DEVICE)
@@ -460,12 +422,12 @@ def _process_window(clips, start_ts, end_ts):
         except Exception as e:
             print(f"[Stage-2] ViViT error: {e}")
             continue
-
+    
     selected.clear()
+    print("Sent for final results and Selected clips cleared")
 
     if vivit_results:
-        _final_output(vivit_results, start_ts, end_ts, all_window_frames)
-
+        _final_output(vivit_results, start_ts, end_ts)
 
 def _preprocess_vivit(frame):
     frame = cv2.resize(frame, (config.ViViT_input_size, config.ViViT_input_size))
@@ -473,29 +435,23 @@ def _preprocess_vivit(frame):
     return np.transpose(frame, (2, 0, 1))
 
 
-def _final_output(vivit_results, start_ts, end_ts, all_window_frames):
+def _final_output(vivit_results, start_ts: datetime.datetime, end_ts: datetime.datetime):
     total = torch.zeros_like(vivit_results[0])
     for p in vivit_results:
         total += p
     avg   = total / len(vivit_results)
     label = config.LABELS[avg.argmax().item()]
     conf  = avg.max().item()
-
     if conf < config.VIVIT_CONF_THRESHOLD and label != "Normal":
         label = "Unknown"
-
     start_str = start_ts.strftime("%H:%M:%S") if start_ts else "unknown"
     end_str   = end_ts.strftime("%H:%M:%S")   if end_ts   else "unknown"
 
     print(f"[ViViT] ══ Detected: {label}  (confidence: {conf:.4f})")
     print(f"[ViViT]    Clip window: {start_str} → {end_str}")
 
-    # Save the anomaly window as MP4 regardless of label (skip Normal)
-    clip_file = None
-    if label != "Normal" and all_window_frames:
-        clip_file = _save_clip(all_window_frames, label, start_ts)
-
-    if label not in ("Normal", "Unknown"):
+    # Broadcast to FastAPI WebSocket clients
+    if label != "Normal":
         from endpoints_1 import broadcast_message, alert_settings
         import asyncio
         if alert_settings.get(label, True):
@@ -506,7 +462,6 @@ def _final_output(vivit_results, start_ts, end_ts, all_window_frames):
                 "confidence": round(conf, 4),
                 "clip_start": start_str,
                 "clip_end":   end_str,
-                "clip_file":  clip_file,   # filename only, e.g. "Burglary_20260413_23-44-07.mp4"
                 "timestamp":  datetime.datetime.now().isoformat(),
             }))
 
@@ -525,17 +480,20 @@ def initialization(ACLAE_path, MILNET_Path, ResNet_path, Yolo_path,
     print("YOLO initialized.")
 
     Aclae = HybridConvLSTM().to(DEVICE)
-    Aclae.load_state_dict(torch.load(ACLAE_path, map_location=DEVICE, weights_only=False))
+    Aclae.load_state_dict(torch.load(ACLAE_path, map_location=DEVICE,
+                                     weights_only=False))
     Aclae.eval()
     print("ConvLSTM Autoencoder initialized.")
 
     MILnet = MILNet(512).to(DEVICE)
-    MILnet.load_state_dict(torch.load(MILNET_Path, map_location=DEVICE, weights_only=False))
+    MILnet.load_state_dict(torch.load(MILNET_Path, map_location=DEVICE,
+                                      weights_only=False))
     MILnet.eval()
     print("MILnet initialized.")
 
     RESnet = models.resnet18(pretrained=False).to(DEVICE)
-    RESnet.load_state_dict(torch.load(ResNet_path, map_location=DEVICE, weights_only=False))
+    RESnet.load_state_dict(torch.load(ResNet_path, map_location=DEVICE,
+                                      weights_only=False))
     RESnet = torch.nn.Sequential(*list(RESnet.children())[:-1])
     RESnet.eval()
     print("ResNet-18 initialized.")
@@ -585,6 +543,7 @@ if __name__ == "__main__":
         print("\n[Main] KeyboardInterrupt — shutting down.")
     finally:
         stop_event.set()
+        # Give Stage-2 a moment to finish its current batch
         with _sec2_lock:
             if _sec2_thread is not None:
                 _sec2_thread.join(timeout=30)
